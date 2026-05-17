@@ -1,0 +1,67 @@
+- name: Create temp dir for zuul-config bootstrap
+  tempfile:
+    state: directory
+  register: bootstrap_tmp
+
+- name: Clone zuul-config repo
+  git:
+    repo: http://admin:secret@gerrit:8080/zuul-config
+    dest: "{{ bootstrap_tmp.path }}/zuul-config"
+    version: master
+
+- name: Create zuul.d directory
+  file:
+    path: "{{ bootstrap_tmp.path }}/zuul-config/zuul.d"
+    state: directory
+
+- name: Create playbooks/base directory
+  file:
+    path: "{{ bootstrap_tmp.path }}/zuul-config/playbooks/base"
+    state: directory
+
+- name: Copy pipeline configuration
+  copy:
+    src: pipelines.yaml
+    dest: "{{ bootstrap_tmp.path }}/zuul-config/zuul.d/pipelines.yaml"
+
+- name: Copy projects configuration
+  copy:
+    src: projects.yaml
+    dest: "{{ bootstrap_tmp.path }}/zuul-config/zuul.d/projects.yaml"
+
+- name: Copy jobs configuration
+  copy:
+    src: jobs.yaml
+    dest: "{{ bootstrap_tmp.path }}/zuul-config/zuul.d/jobs.yaml"
+
+- name: Copy pre-run playbook
+  copy:
+    src: pre.yaml
+    dest: "{{ bootstrap_tmp.path }}/zuul-config/playbooks/base/pre.yaml"
+
+- name: Copy cleanup playbook
+  copy:
+    src: cleanup.yaml
+    dest: "{{ bootstrap_tmp.path }}/zuul-config/playbooks/base/cleanup.yaml"
+
+- name: Copy post-logs playbook
+  copy:
+    src: post-logs.yaml
+    dest: "{{ bootstrap_tmp.path }}/zuul-config/playbooks/base/post-logs.yaml"
+
+- name: Commit and push zuul-config boilerplate
+  shell:
+    executable: /bin/sh
+    chdir: "{{ bootstrap_tmp.path }}/zuul-config"
+    cmd: |
+      set -e
+      git config user.name "Admin"
+      git config user.email "admin@example.com"
+      git add zuul.d playbooks
+      git commit -m "Add initial Zuul configuration"
+      git push origin +HEAD:master
+
+- name: Clean up temp directory
+  file:
+    path: "{{ bootstrap_tmp.path }}"
+    state: absent

@@ -1,0 +1,136 @@
+# Tutorial lab VM: one instance on "private" + floating IP on "public".
+# Neutron security group: ingress from 0.0.0.0/0 on SSH + Zuul tutorial
+# compose ports (internal lab — not for production).
+# Minimal cloud-init (docker-compose only) for Zuul-style compose workflows.
+
+heat_template_version: rocky
+
+description: >
+  Single VM for hands-on Zuul/OpenStack tutorial work: NIC on "private",
+  floating IP on "public".
+
+parameters:
+  image:
+    type: string
+    description: Glance image name or ID
+    default: ubuntu-noble-server
+
+  flavor:
+    type: string
+    description: Nova flavor name or ID
+    default: m1.large
+
+  private_network:
+    type: string
+    description: Existing Neutron network for the VM NIC
+    default: private
+
+  public_network:
+    type: string
+    description: External / floating-IP pool network name or ID
+    default: public
+
+  server_name:
+    type: string
+    description: Nova instance display name
+    default: zuul-heat-tutorial
+
+  key_name:
+    type: string
+    description: Existing Nova keypair name for SSH access to the VM
+    default: default
+
+  security_group_name:
+    type: string
+    description: Neutron security group name (must be unique in the project)
+    default: zuul-heat-tutorial-sg
+
+resources:
+  vm_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { get_param: security_group_name }
+      description: >
+        Internal lab only — ingress TCP from 0.0.0.0/0 on SSH 22 and Zuul
+        tutorial compose ports (Gerrit 8080/29418, web 9000, logs 8000).
+      rules:
+        # Host administration
+        - direction: ingress
+          ethertype: IPv4
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        # Gerrit
+        - direction: ingress
+          ethertype: IPv4
+          protocol: tcp
+          port_range_min: 8080
+          port_range_max: 8080
+          remote_ip_prefix: 0.0.0.0/0
+        - direction: ingress
+          ethertype: IPv4
+          protocol: tcp
+          port_range_min: 29418
+          port_range_max: 29418
+          remote_ip_prefix: 0.0.0.0/0
+        # Zuul web
+        - direction: ingress
+          ethertype: IPv4
+          protocol: tcp
+          port_range_min: 9000
+          port_range_max: 9000
+          remote_ip_prefix: 0.0.0.0/0
+        # Apache log static server
+        - direction: ingress
+          ethertype: IPv4
+          protocol: tcp
+          port_range_min: 8000
+          port_range_max: 8000
+          remote_ip_prefix: 0.0.0.0/0
+
+  vm_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: private_network }
+      security_groups:
+        - { get_resource: vm_security_group }
+
+  vm:
+    type: OS::Nova::Server
+    properties:
+      name: { get_param: server_name }
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: vm_port }
+      # cloud-init: docker-compose only (tutorial-friendly)
+      user_data_format: RAW
+      user_data: |
+        #cloud-config
+        package_update: true
+        packages:
+          - git
+          - git-review
+          - docker-compose-v2
+          - docker-buildx
+          - python3-openstackclient
+          - python3-heatclient
+        runcmd:
+          - [ sh, -c, 'echo "127.0.0.1 zuul-heat-tutorial.lab.example.com" >> /etc/hosts' ]
+
+  vm_fip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_network }
+      port_id: { get_resource: vm_port }
+
+outputs:
+  floating_ip:
+    description: Public IPv4 (floating) for reaching the VM
+    value: { get_attr: [vm_fip, floating_ip_address] }
+
+  server_id:
+    description: Nova server UUID
+    value: { get_resource: vm }

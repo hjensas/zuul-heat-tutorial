@@ -1,0 +1,11 @@
+services:
+  gerritconfig:
+    image: localhost/zuul-ci/zuul-executor:dev
+  scheduler:
+    image: localhost/zuul-ci/zuul-scheduler:dev
+  web:
+    image: localhost/zuul-ci/zuul-web:dev
+  executor:
+    image: localhost/zuul-ci/zuul-executor:dev
+  launcher:
+    image: localhost/zuul-ci/zuul-launcher:dev
