@@ -100,7 +100,7 @@ review change. This will automatically fetch the latest patchset:
 .. code-block:: bash
 
    # Define the change ID
-   CHANGE_ID="988758"
+   CHANGE_ID="989884"
 
    # Fetch the latest ref string from the OpenDev API
    LATEST_REF=$(curl -s "https://review.opendev.org/changes/$CHANGE_ID/revisions/current/review" | tail -n +2 | jq -r '.current_revision')
@@ -292,10 +292,18 @@ Heat Orchestration Templates (HOT).
 * Uses **Heat Orchestration Templates (HOT)** stored in your project repository
 * Each template defines a complete environment (VMs, networks, routers,
   volumes, etc.)
-* Each Heat stack = one Zuul "node" (with a bastion host that Zuul connects
-  to)
+* Each Heat stack = one Zuul gateway node (a bastion host that Zuul connects
+  to directly)
+* Additional nodes in the same nodeset can be declared as **via-nodes** —
+  they appear in the Ansible inventory and are reached through the gateway
+  via SSH ProxyJump
 * The heat flavor configuration defines **resource limits** that Zuul enforces
-* Templates must output ``bastion_ip`` so Zuul can SSH to the bastion host
+* Templates must output ``bastion_ip`` so Zuul can SSH to the gateway host
+* Templates that expose private nodes as via-nodes must also output
+  ``zuul_via_nodes`` (see the `Zuul nodeset documentation
+  <https://zuul-ci.org/docs/zuul/latest/config/nodeset.html>`_ and the
+  `Heat driver via-nodes section
+  <https://zuul-ci.org/docs/zuul/latest/drivers/heat.html#via-nodes-in-the-inventory>`_)
 
 Verify OpenStack Credentials
 -----------------------------
@@ -339,8 +347,9 @@ Create Nova Keypair for Executor SSH Access
 --------------------------------------------
 
 The Heat driver passes a ``zuul_key_name`` parameter to every template so the
-bastion server can be configured with the executor's SSH public key. You need
-to create a Nova keypair from the executor's nodepool public key:
+gateway and any via-nodes can be configured with the executor's SSH public
+key. You need to create a Nova keypair from the executor's nodepool public
+key:
 
 .. code-block:: bash
 
@@ -544,7 +553,7 @@ Clone the test1 project to your workstation:
    git review -s
    mkdir -p zuul.heat.d
 
-Create a Heat template with a bastion and an internal node:
+Create a Heat template with a bastion gateway and an internal via-node:
 
 .. code-block:: bash
 
@@ -552,9 +561,10 @@ Create a Heat template with a bastion and an internal node:
    heat_template_version: 2015-04-30
 
    description: >
-     Lab environment with bastion and internal node for Zuul CI.
-     The bastion is reachable via floating IP; the internal node
-     is on a private network accessible only from the bastion.
+     Lab environment with bastion gateway and internal node for Zuul CI.
+     The bastion is reachable via floating IP; the internal node is on a
+     private network. Zuul reaches internal as a via-node (ProxyJump) and
+     the bastion can also SSH to internal directly using an ephemeral key.
 
    parameters:
      zuul_key_name:
@@ -566,14 +576,14 @@ Create a Heat template with a bastion and an internal node:
        description: Username injected by Zuul for SSH access
      zuul_image:
        type: string
-       description: Glance image for the bastion node
+       description: Glance image for all nodes
      zuul_ephemeral_public_key:
        type: string
-       description: Ed25519 public key for internal node access
+       description: Ed25519 public key for bastion-to-internal SSH
      zuul_ephemeral_private_key:
        type: string
        hidden: true
-       description: Ed25519 private key for bastion to reach internal nodes
+       description: Ed25519 private key injected on bastion for internal access
      zuul_external_network:
        type: string
        description: >
@@ -585,16 +595,6 @@ Create a Heat template with a bastion and an internal node:
        description: Custom parameter (demonstrates parameter override)
 
    resources:
-     internal_keypair:
-       type: OS::Nova::KeyPair
-       properties:
-         name:
-           str_replace:
-             template: $STACK_NAME-internal
-             params:
-               $STACK_NAME: { get_param: "OS::stack_name" }
-         public_key: { get_param: zuul_ephemeral_public_key }
-
      private_net:
        type: OS::Neutron::Net
 
@@ -622,26 +622,33 @@ Create a Heat template with a bastion and an internal node:
        type: OS::Heat::CloudConfig
        properties:
          cloud_config:
-          write_files:
-            - defer: true
-              path:
-                str_replace:
-                  template: /home/$USER/.ssh/id_ed25519
-                  params:
-                    $USER: { get_param: zuul_username }
-              permissions: '0600'
-              owner:
-                str_replace:
-                  template: $USER:$USER
-                  params:
-                    $USER: { get_param: zuul_username }
-              content: { get_param: zuul_ephemeral_private_key }
+           write_files:
+             - defer: true
+               path:
+                 str_replace:
+                   template: /home/$USER/.ssh/id_ed25519
+                   params:
+                     $USER: { get_param: zuul_username }
+               permissions: '0600'
+               owner:
+                 str_replace:
+                   template: $USER:$USER
+                   params:
+                     $USER: { get_param: zuul_username }
+               content: { get_param: zuul_ephemeral_private_key }
 
      bastion_init:
        type: OS::Heat::MultipartMime
        properties:
          parts:
            - config: { get_resource: bastion_write_files }
+
+     internal_init:
+       type: OS::Heat::CloudConfig
+       properties:
+         cloud_config:
+           ssh_authorized_keys:
+             - { get_param: zuul_ephemeral_public_key }
 
      bastion_port:
        type: OS::Neutron::Port
@@ -668,9 +675,11 @@ Create a Heat template with a bastion and an internal node:
        properties:
          flavor: m1.small
          image: { get_param: zuul_image }
-         key_name: { get_resource: internal_keypair }
+         key_name: { get_param: zuul_key_name }
          networks:
            - network: { get_resource: private_net }
+         user_data: { get_resource: internal_init }
+         user_data_format: RAW
 
      bastion_fip:
        type: OS::Neutron::FloatingIP
@@ -682,8 +691,14 @@ Create a Heat template with a bastion and an internal node:
      bastion_ip:
        description: Floating IP of bastion host (REQUIRED by Zuul)
        value: { get_attr: [bastion_fip, floating_ip_address] }
+     zuul_via_nodes:
+       description: Connection details for via-nodes in the nodeset
+       value:
+         internal:
+           host: { get_attr: [internal_node, first_address] }
+           user: { get_param: zuul_username }
      internal_node_ip:
-       description: Private IP of internal node (for reference)
+       description: Private IP of internal node (for bastion SSH hop testing)
        value: { get_attr: [internal_node, first_address] }
      custom_parameter:
        description: Custom parameter value (demonstrates get_param)
@@ -692,10 +707,25 @@ Create a Heat template with a bastion and an internal node:
 
 **Important notes about the template:**
 
-* **MultipartMime pattern**: The template uses ``OS::Heat::MultipartMime`` to combine
-  separate cloud-config parts. The ``bastion_runcmd`` part runs first to ensure
-  the ``.ssh`` directory exists with proper permissions before ``bastion_write_files``
-  writes the ephemeral key. ``defer: true`` is also used for ``bastion_write_files`` to further ensure proper ordering and prevent permission errors
+* The template demonstrates **two ways** to reach the internal node:
+
+  * **Via-node (ProxyJump)**: Zuul connects from the executor through the
+    bastion to ``internal`` using ``zuul_key_name`` on both nodes. Connection
+    details come from the ``zuul_via_nodes`` output
+  * **Bastion SSH hop**: The bastion receives an ephemeral private key via
+    cloud-init and the internal node authorizes the matching public key. Job
+    playbooks running on ``bastion`` can ``ssh`` to the internal IP directly
+
+* Both the **bastion** and **internal_node** use ``zuul_key_name`` as their
+  Nova ``key_name`` so the executor can reach the via-node. The ephemeral
+  keypair is an additional credential for bastion-to-internal access
+* **MultipartMime on bastion**: ``defer: true`` on ``bastion_write_files``
+  ensures the ephemeral private key is written after cloud-init has created
+  the ``.ssh`` directory
+* The ``zuul_via_nodes`` output maps the nodeset node name ``internal`` to
+  the internal VM's private IP. The Heat driver copies this into
+  ``node_properties.via_nodes`` on the gateway node after the stack reaches
+  ``CREATE_COMPLETE``
 * The Heat driver only passes a ``zuul_*`` parameter when the template
   declares it — undeclared parameters are simply not sent. Declare only the
   ones your template actually uses
@@ -707,18 +737,21 @@ Create a Heat template with a bastion and an internal node:
 Create a Heat-based Test Job
 -----------------------------
 
-First, create a simple test playbook that the job will run:
+First, create a test playbook that validates **both** connectivity paths —
+via-node (executor ProxyJump to ``internal``) and bastion SSH hop
+(``bastion`` → internal using the ephemeral key):
 
 .. code-block:: bash
 
   mkdir -p playbooks
   cat << 'EOF' > playbooks/testjob.yaml
-  - hosts: all
+  - hosts: bastion
+    gather_facts: true
     tasks:
       - name: Show bastion node information
         debug:
           msg: |
-            Running on {{ inventory_hostname }}
+            Running on gateway node {{ inventory_hostname }}
             Hostname: {{ ansible_hostname }}
 
       - name: Display Heat stack outputs
@@ -727,7 +760,7 @@ First, create a simple test playbook that the job will run:
             Heat Stack Outputs:
             {{ nodepool.node_properties.heat_stack_outputs | to_nice_yaml }}
 
-      - name: Check if cloud-init is complete
+      - name: Check if cloud-init is complete on bastion
         command: cloud-init status --wait
         register: cloud_init_status
         ignore_errors: true
@@ -736,37 +769,53 @@ First, create a simple test playbook that the job will run:
         debug:
           var: cloud_init_status
 
-      - name: Check for internal node SSH key
+      - name: Check for ephemeral SSH key on bastion
         stat:
           path: ~/.ssh/id_ed25519
         register: internal_key
 
-      - name: Verify ephemeral key was injected
+      - name: Verify ephemeral key was injected on bastion
         debug:
-          msg: "Ephemeral SSH key for internal node: {{ 'present' if internal_key.stat.exists else 'missing' }}"
+          msg: "Ephemeral SSH key for bastion-to-internal hop: {{ 'present' if internal_key.stat.exists else 'missing' }}"
 
-      - name: List .ssh directory contents
-        command: ls -la ~/.ssh/
-        register: ssh_dir
-
-      - name: Show .ssh directory
-        debug:
-          var: ssh_dir.stdout_lines
-
-      - name: Test SSH connection to internal node
+      - name: Test SSH from bastion to internal node
         shell: |
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -i ~/.ssh/id_ed25519 \
-            ubuntu@{{ nodepool.node_properties.heat_stack_outputs.internal_node_ip }} \
+            {{ nodepool.node_properties.heat_stack_outputs.zuul_via_nodes.internal.user | default('ubuntu') }}@{{ nodepool.node_properties.heat_stack_outputs.internal_node_ip }} \
             uname -a
-        register: internal_ssh_test
+        register: bastion_ssh_test
         ignore_errors: true
 
-      - name: Show internal node SSH test result
+      - name: Show bastion-to-internal SSH test result
         debug:
           msg: |
-            SSH to internal node: {{ 'SUCCESS' if internal_ssh_test.rc == 0 else 'FAILED' }}
-            Output: {{ internal_ssh_test.stdout }}
+            Bastion SSH hop to internal: {{ 'SUCCESS' if bastion_ssh_test.rc == 0 else 'FAILED' }}
+            Output: {{ bastion_ssh_test.stdout }}
+
+  - hosts: internal
+    gather_facts: true
+    tasks:
+      - name: Show internal via-node information
+        debug:
+          msg: |
+            Running on via-node {{ inventory_hostname }}
+            Hostname: {{ ansible_hostname }}
+            Connected from executor through bastion via SSH ProxyJump
+
+      - name: Verify internal node is reachable via via-node
+        command: uname -a
+        register: via_node_uname
+
+      - name: Show internal node uname (via-node path)
+        debug:
+          var: via_node_uname.stdout
+
+  - hosts: all
+    tasks:
+      - name: Confirm all nodeset nodes are reachable
+        debug:
+          msg: "Successfully reached {{ inventory_hostname }} ({{ ansible_hostname }})"
 
       - name: Test the Heat stack environment
         shell: |
@@ -786,7 +835,7 @@ template:
 
    cat << 'EOF' >> .zuul.yaml
 
-   # Nodeset using Heat template
+   # Nodeset using Heat template with a via-node
    - nodeset:
        name: heat-nodeset
        nodes:
@@ -796,6 +845,8 @@ template:
              heat-template-path: zuul.heat.d/lab-stack.yaml
              heat-parameters:
                custom_parameter: my-custom-value
+         - name: internal
+           via: bastion
 
    # Job using Heat resources
    - job:
@@ -817,7 +868,10 @@ template:
 
 **Understanding the configuration:**
 
-* The **nodeset** defines a node using the ``heat-lab`` label
+* The **nodeset** defines a gateway node using the ``heat-lab`` label and an
+  **internal** via-node reached through the gateway
+* Only the gateway node consumes a label slot — the via-node is not
+  independently allocated but appears in the Ansible inventory
 * ``template-config`` specifies the Heat template path (relative to the
   project root)
 * ``heat-parameters`` allows you to pass custom parameter values to the Heat
@@ -826,7 +880,12 @@ template:
 * The path must be inside a directory declared via ``heat-template-dirs`` in
   the tenant config
 * Zuul will create the entire Heat stack defined in the template
-* The job runs on the bastion host (accessed via the ``bastion_ip`` output)
+* The Heat template's ``zuul_via_nodes`` output supplies connection details
+  for the internal node; Zuul connects to it via SSH ProxyJump through bastion
+* The template also injects an ephemeral keypair so playbooks on ``bastion``
+  can SSH to the internal IP directly — a separate path from the via-node
+* The job playbook validates both paths: ``hosts: internal`` exercises
+  via-node/ProxyJump; tasks on ``bastion`` exercise the SSH hop
 
 Upload and Test
 ---------------
@@ -841,7 +900,9 @@ Upload the test1 changes (including the Heat template and playbook):
 
 Visit the `Gerrit dashboard <http://zuul-heat-tutorial.lab.example.com:8080/dashboard/self>`_ to see
 your change. Zuul will run the ``testjob-heat`` job which creates a Heat stack
-(bastion + internal node) and runs on the bastion host.
+(bastion + internal node) and validates both the via-node path (executor →
+bastion → internal via ProxyJump) and the bastion SSH hop (bastion → internal
+using the ephemeral key).
 
 You can watch the `Zuul status page <http://zuul-heat-tutorial.lab.example.com:9000/t/example-tenant/status>`_ to
 see the Heat stack being provisioned.
@@ -869,8 +930,16 @@ When a job uses a Heat-based nodeset:
 
 5. Zuul waits for the **bastion host** to become accessible via SSH (using the
    ``bastion_ip`` output)
-6. **Zuul Executor** connects to the bastion and runs the job
-7. After job completion, the **entire Heat stack is deleted**, cleaning up all
+6. **Zuul Executor** builds the Ansible inventory:
+
+   * The gateway node (``bastion``) is connected to directly
+   * Via-nodes (``internal``) are added using connection details from
+     ``node_properties.via_nodes``, with SSH ProxyJump through the gateway
+
+7. The job playbook runs on all nodes in the nodeset — validating both the
+   via-node path (``hosts: internal``) and bastion SSH hop (tasks on
+   ``bastion`` using the ephemeral key)
+8. After job completion, the **entire Heat stack is deleted**, cleaning up all
    resources
 
 This provides true CI isolation - each job gets a fresh, dedicated environment
@@ -896,14 +965,19 @@ If the Heat job fails to start:
 5. **Check Heat stack status**: ``openstack stack list`` and ``openstack stack
    show <stack-name>`` to see stack creation errors
 6. **Review template outputs**: The template must output ``bastion_ip`` for
-   Zuul to connect
+   Zuul to connect. Via-nodes additionally require a ``zuul_via_nodes`` output
+   whose keys match the via-node names in the nodeset
+7. **Via-node SSH failures**: If the ``internal`` play fails but ``bastion``
+   succeeds, check executor logs for ProxyJump or missing ``via_nodes`` errors
 
 Common issues:
 
 * Template missing ``bastion_ip`` output
+* ``zuul_via_nodes`` output missing or using a key that does not match the
+  via-node name in the nodeset (e.g. ``internal``)
 * ``image-id`` in provider config doesn't match a Glance image name or UUID
 * Nova keypair (``key-name``) doesn't exist or doesn't contain the executor's
-  public key
+  public key (must be authorised on both gateway and via-nodes)
 * Insufficient quota for resources defined in template
 
 Next Steps

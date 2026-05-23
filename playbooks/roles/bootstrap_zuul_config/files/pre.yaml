@@ -1,4 +1,6 @@
 - hosts: all
   roles:
     - add-build-sshkey
+- hosts: all:!zuul_via_nodes
+  roles:
     - prepare-workspace-git
