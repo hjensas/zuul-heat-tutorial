@@ -100,7 +100,7 @@ review change. This will automatically fetch the latest patchset:
 .. code-block:: bash
 
    # Define the change ID
-   CHANGE_ID="989884"
+   CHANGE_ID="990995"
 
    # Fetch the latest ref string from the OpenDev API
    LATEST_REF=$(curl -s "https://review.opendev.org/changes/$CHANGE_ID/revisions/current/review" | tail -n +2 | jq -r '.current_revision')
